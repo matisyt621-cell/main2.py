@@ -953,10 +953,28 @@ def main():
     
     mpy_config.change_settings({"IMAGEMAGICK_BINARY": OmegaCore.get_magick_path()})
     
+    # Inicjalizacja konfiguracji z obsługą starszych wersji (bezpieczne dodawanie nowych pól)
     if 'current_text_style' not in st.session_state:
         st.session_state.current_text_style = TextStyleConfig()
+    else:
+        # Jeśli istnieje, upewnij się, że ma wszystkie pola (merge z domyślnymi)
+        existing = st.session_state.current_text_style
+        if hasattr(existing, '__dict__'):
+            d = existing.__dict__.copy()
+        else:
+            d = dict(existing)
+        st.session_state.current_text_style = TextStyleConfig(**d)
+    
     if 'current_video_config' not in st.session_state:
         st.session_state.current_video_config = VideoConfig()
+    else:
+        existing = st.session_state.current_video_config
+        if hasattr(existing, '__dict__'):
+            d = existing.__dict__.copy()
+        else:
+            d = dict(existing)
+        st.session_state.current_video_config = VideoConfig(**d)
+    
     if 'temp_files' not in st.session_state:
         st.session_state.temp_files = []
     
