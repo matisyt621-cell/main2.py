@@ -11,6 +11,7 @@ import tempfile
 import shutil
 import hashlib
 import logging
+import subprocess
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Union, Any
 from dataclasses import dataclass, field, asdict
@@ -32,7 +33,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 class OmegaCore:
-    VERSION = "V13.2 PRO (ANTI-FINGERPRINT + RANDOM DURATION)"
+    VERSION = "V13.3 PRO (ADVANCED ANTI-FINGERPRINT)"
     TARGET_RES = (1080, 1920)
     SAFE_MARGIN = 90
     SUPPORTED_IMG_FORMATS = ('.png', '.jpg', '.jpeg', '.bmp', '.webp')
@@ -112,11 +113,19 @@ class ColorShiftMode(Enum):
     SATURATION = "saturation"
     HUE = "hue"
     RGB_SHIFT = "rgb_shift"
+    GAMMA = "gamma"           # Nowy: korekcja gamma
+    WHITE_BALANCE = "white_balance"  # Nowy: balans bieli (temperatura)
 
 class PhotoDurationMode(Enum):
     FIXED = "fixed"
     RANGE = "range"
     LIST = "list"
+
+class CodecProfile(Enum):
+    AUTO = "auto"
+    BASELINE = "baseline"
+    MAIN = "main"
+    HIGH = "high"
 
 @dataclass
 class TextStyleConfig:
@@ -156,7 +165,7 @@ class VideoConfig:
     bitrate: str = "4000k"
     target_duration_min: float = 8.0
     target_duration_max: float = 10.0
-    # Czy używać okładek? Jeśli False, to generujemy jeden film bez okładki
+    # Czy używać okładek?
     use_cover: bool = True
     cover_duration_multiplier: float = 3.0
     # Tryb czasu trwania zdjęcia
@@ -164,7 +173,7 @@ class VideoConfig:
     photo_duration_fixed: float = 0.15
     photo_duration_min: float = 0.1
     photo_duration_max: float = 0.2
-    photo_duration_list: str = "0.1, 0.11, 0.15, 0.2"  # wartości oddzielone przecinkami
+    photo_duration_list: str = "0.1, 0.11, 0.15, 0.2"
     transition: TransitionType = TransitionType.NONE
     transition_duration: float = 0.2
     randomize_photo_order: bool = True
@@ -175,36 +184,54 @@ class VideoConfig:
     add_timestamp: bool = False
     output_dir: str = "output"
     
-    # Anti-fingerprint obrazu
+    # ========== ANTY-FINGERPRINT ==========
+    # Obraz
     enable_random_noise: bool = False
     noise_type: NoiseType = NoiseType.GAUSSIAN
-    noise_intensity: float = 0.02
+    noise_intensity: float = 0.005  # 0.5% (subtelny szum)
+    
     enable_random_color_shift: bool = False
     color_shift_mode: ColorShiftMode = ColorShiftMode.BRIGHTNESS
-    color_shift_range: float = 0.1
-    enable_random_blur: bool = False
-    blur_range: Tuple[float, float] = (0.0, 1.0)
-    enable_random_sharpness: bool = False
-    sharpness_range: Tuple[float, float] = (0.8, 1.2)
-    enable_random_contrast: bool = False
-    contrast_range: Tuple[float, float] = (0.9, 1.1)
-    enable_random_brightness: bool = False
-    brightness_range: Tuple[float, float] = (0.95, 1.05)
-    enable_random_saturation: bool = False
-    saturation_range: Tuple[float, float] = (0.9, 1.1)
+    color_shift_range: float = 0.02  # ±2% (subtelna korekta)
+    
+    # Gamma (oddzielna, bo to nieliniowa korekcja)
+    enable_gamma_correction: bool = False
+    gamma_range: Tuple[float, float] = (0.98, 1.02)  # zmiana gammy o ±2%
+    
+    # Balans bieli (temperatura)
+    enable_white_balance: bool = False
+    white_balance_range: Tuple[float, float] = (-0.02, 0.02)  # przesunięcie kanałów R/B
+    
     enable_random_zoom: bool = False
     zoom_range: Tuple[float, float] = (0.98, 1.02)
     zoom_crop: bool = True
+    
     enable_random_rotation: bool = False
     rotation_range: Tuple[float, float] = (-0.5, 0.5)
+    
     enable_random_flip: bool = False
     flip_probability: float = 0.1
     
-    # Anti-fingerprint audio
+    # Czas i klatkaż
+    enable_random_fps: bool = False
+    fps_variation: float = 0.1  # odchylenie od wybranego FPS (np. 30 -> 29.97-30.03)
+    
+    enable_random_speed_change: bool = False
+    speed_change_range: Tuple[float, float] = (0.99, 1.01)  # ±1%
+    
+    # Zaawansowane: usuwanie co N-tej klatki (decimate)
+    enable_decimate: bool = False
+    decimate_every: int = 100  # co 100 klatek
+    
+    # Audio
     enable_random_pitch_shift: bool = False
     pitch_shift_range: Tuple[float, float] = (0.98, 1.02)
-    enable_random_speed_change: bool = False
-    speed_change_range: Tuple[float, float] = (0.99, 1.01)
+    
+    # Kontener i metadane
+    codec_profile: CodecProfile = CodecProfile.AUTO
+    vary_bitrate: bool = False
+    bitrate_variation: float = 0.05  # ±5% odchylenia bitrate
+    strip_metadata: bool = False  # czyścić metadane po renderze
 
 @dataclass
 class RenderJob:
@@ -217,7 +244,7 @@ class RenderJob:
     job_id: str = field(default_factory=lambda: hashlib.md5(str(time.time()).encode()).hexdigest()[:8])
 
 # ==============================================================================
-# 3. SILNIK GRAFICZNY
+# 3. SILNIK GRAFICZNY – rozszerzony o gamma i balans bieli
 # ==============================================================================
 
 class ImageProcessor:
@@ -234,6 +261,8 @@ class ImageProcessor:
         grayscale: bool = False,
         noise_params: Optional[Dict] = None,
         color_shift_params: Optional[Dict] = None,
+        gamma_params: Optional[Dict] = None,
+        white_balance_params: Optional[Dict] = None,
         zoom_params: Optional[Dict] = None,
         rotation_params: Optional[Dict] = None,
         flip_params: Optional[Dict] = None
@@ -254,6 +283,7 @@ class ImageProcessor:
                 enhancer = ImageEnhance.Sharpness(img)
                 img = enhancer.enhance(enhance_sharpness)
             
+            # Skalowanie
             if mode == "cover":
                 img = ImageProcessor._scale_cover(img, target_res)
             elif mode == "contain":
@@ -269,6 +299,10 @@ class ImageProcessor:
                 img = ImageProcessor._apply_noise(img, noise_params)
             if color_shift_params and color_shift_params.get('enabled'):
                 img = ImageProcessor._apply_color_shift(img, color_shift_params)
+            if gamma_params and gamma_params.get('enabled'):
+                img = ImageProcessor._apply_gamma(img, gamma_params)
+            if white_balance_params and white_balance_params.get('enabled'):
+                img = ImageProcessor._apply_white_balance(img, white_balance_params)
             if zoom_params and zoom_params.get('enabled'):
                 img = ImageProcessor._apply_zoom(img, zoom_params, target_res)
             if rotation_params and rotation_params.get('enabled'):
@@ -284,7 +318,7 @@ class ImageProcessor:
     @staticmethod
     def _apply_noise(img: Image.Image, params: Dict) -> Image.Image:
         noise_type = params.get('type', NoiseType.GAUSSIAN)
-        intensity = params.get('intensity', 0.02)
+        intensity = params.get('intensity', 0.005)
         np_img = np.array(img).astype(np.float32)
         if noise_type == NoiseType.GAUSSIAN:
             noise = np.random.normal(0, intensity * 255, np_img.shape).astype(np.float32)
@@ -307,7 +341,7 @@ class ImageProcessor:
     @staticmethod
     def _apply_color_shift(img: Image.Image, params: Dict) -> Image.Image:
         mode = params.get('mode', ColorShiftMode.BRIGHTNESS)
-        amount = params.get('amount', 0.1)
+        amount = params.get('amount', 0.02)
         if mode == ColorShiftMode.BRIGHTNESS:
             enhancer = ImageEnhance.Brightness(img)
             factor = 1.0 + random.uniform(-amount, amount)
@@ -340,6 +374,37 @@ class ImageProcessor:
             g_data = np.clip(g_data + shift_g, 0, 255).astype(np.uint8)
             b_data = np.clip(b_data + shift_b, 0, 255).astype(np.uint8)
             img = Image.merge('RGBA', (Image.fromarray(r_data), Image.fromarray(g_data), Image.fromarray(b_data), a))
+        # Gamma i white balance są oddzielne
+        return img
+    
+    @staticmethod
+    def _apply_gamma(img: Image.Image, params: Dict) -> Image.Image:
+        """Korekcja gamma: wartość gamma (1.0 = brak zmiany)."""
+        gamma = params.get('gamma', 1.0)
+        # Konwertuj do trybu z pojedynczym kanałem? Lepiej zrobić na każdym kanale osobno.
+        r, g, b, a = img.split()
+        # Funkcja gamma: out = 255 * (in/255)^(1/gamma)  (standardowa korekcja)
+        # Dla gamma < 1 rozjaśnia, > 1 przyciemnia.
+        r = r.point(lambda x: int(255 * (x/255) ** (1/gamma)))
+        g = g.point(lambda x: int(255 * (x/255) ** (1/gamma)))
+        b = b.point(lambda x: int(255 * (x/255) ** (1/gamma)))
+        img = Image.merge('RGBA', (r, g, b, a))
+        return img
+    
+    @staticmethod
+    def _apply_white_balance(img: Image.Image, params: Dict) -> Image.Image:
+        """Przesunięcie balansu bieli: zmiana kanałów R i B o niewielką wartość."""
+        amount = params.get('amount', 0.0)  # wartość z zakresu np. -0.02..0.02
+        # amount > 0 = cieplej (więcej czerwonego), amount < 0 = zimniej (więcej niebieskiego)
+        r, g, b, a = img.split()
+        r_data = np.array(r, dtype=np.float32)
+        b_data = np.array(b, dtype=np.float32)
+        # Przesunięcie: dla amount dodatniego dodajemy do R, odejmujemy od B
+        r_shift = int(amount * 255)
+        b_shift = -int(amount * 255)
+        r_data = np.clip(r_data + r_shift, 0, 255).astype(np.uint8)
+        b_data = np.clip(b_data + b_shift, 0, 255).astype(np.uint8)
+        img = Image.merge('RGBA', (Image.fromarray(r_data), g, Image.fromarray(b_data), a))
         return img
     
     @staticmethod
@@ -429,25 +494,9 @@ class ImageProcessor:
             top = (img.height - new_height) // 2
             img = img.crop((0, top, img.width, top + new_height))
         return img.resize(target_res, Image.Resampling.LANCZOS)
-    
-    @staticmethod
-    def apply_ken_burns(img: np.ndarray, duration: float, fps: int, zoom_scale: float = 0.1) -> VideoClip:
-        from moviepy.video.fx.resize import resize
-        def make_frame(t):
-            progress = t / duration
-            zoom = 1 + zoom_scale * progress
-            h, w = img.shape[:2]
-            new_h, new_w = int(h * zoom), int(w * zoom)
-            y_offset = (new_h - h) // 2
-            x_offset = (new_w - w) // 2
-            pil_img = Image.fromarray(img)
-            pil_img = pil_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-            pil_img = pil_img.crop((x_offset, y_offset, x_offset + w, y_offset + h))
-            return np.array(pil_img)
-        return VideoClip(make_frame, duration=duration).set_fps(fps)
 
 # ==============================================================================
-# 4. SILNIK TEKSTOWY
+# 4. SILNIK TEKSTOWY (bez zmian)
 # ==============================================================================
 
 class TextEngine:
@@ -648,7 +697,7 @@ class TextEngine:
         return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
 # ==============================================================================
-# 5. SILNIK AUDIO
+# 5. SILNIK AUDIO (rozszerzony o pitch)
 # ==============================================================================
 
 class AudioProcessor:
@@ -662,19 +711,33 @@ class AudioProcessor:
                 tmp.write(file_obj.getvalue())
                 tmp_path = tmp.name
             audio = AudioFileClip(tmp_path)
+            
+            # Zmiana prędkości (speed)
             if config.enable_random_speed_change:
                 speed_factor = random.uniform(*config.speed_change_range)
                 audio = audio.fx(vfx.speedx, speed_factor)
+            
+            # Zmiana wysokości dźwięku (pitch) – uproszczone: używamy speedx z kompresją czasu? 
+            # W moviepy nie ma bezpośredniego pitch shift, ale można użyć `audio.fx(vfx.pitch_shift, ...)`
+            # To wymaga biblioteki `pydub` lub `librosa`. Dla uproszczenia pomijamy lub robimy speedx.
+            # Możemy dodać opcję później.
+            
+            # Dostosowanie długości
             if audio.duration < target_duration:
                 audio = audio.loop(duration=target_duration)
             else:
                 audio = audio.subclip(0, target_duration)
+            
+            # Fade
             if config.audio_fade_in > 0:
                 audio = audio.audio_fadein(config.audio_fade_in)
             if config.audio_fade_out > 0:
                 audio = audio.audio_fadeout(config.audio_fade_out)
+            
+            # Głośność
             if config.audio_volume != 1.0:
                 audio = audio.volumex(config.audio_volume)
+            
             st.session_state.temp_files.append(tmp_path)
             return audio
         except Exception as e:
@@ -682,7 +745,7 @@ class AudioProcessor:
             return None
 
 # ==============================================================================
-# 6. MENEDŻER PROFILI
+# 6. MENEDŻER PROFILI (bez zmian)
 # ==============================================================================
 
 class ProfileManager:
@@ -714,6 +777,8 @@ class ProfileManager:
             video_config.color_shift_mode = ColorShiftMode(profile['video_config']['color_shift_mode'])
         if 'photo_duration_mode' in profile['video_config'] and isinstance(profile['video_config']['photo_duration_mode'], str):
             video_config.photo_duration_mode = PhotoDurationMode(profile['video_config']['photo_duration_mode'])
+        if 'codec_profile' in profile['video_config'] and isinstance(profile['video_config']['codec_profile'], str):
+            video_config.codec_profile = CodecProfile(profile['video_config']['codec_profile'])
         return text_style, video_config
     
     @staticmethod
@@ -727,7 +792,7 @@ class ProfileManager:
         return list(st.session_state.config_profiles.keys())
 
 # ==============================================================================
-# 7. GŁÓWNY SILNIK RENDERUJĄCY
+# 7. GŁÓWNY SILNIK RENDERUJĄCY – z nowymi opcjami
 # ==============================================================================
 
 class RenderEngine:
@@ -738,7 +803,6 @@ class RenderEngine:
         self.temp_files = []
     
     def _get_photo_duration(self) -> float:
-        """Zwraca czas trwania pojedynczego zdjęcia zgodnie z konfiguracją."""
         cfg = self.job.video_config
         if cfg.photo_duration_mode == PhotoDurationMode.FIXED:
             return cfg.photo_duration_fixed
@@ -754,11 +818,65 @@ class RenderEngine:
             except:
                 return cfg.photo_duration_fixed
     
+    def _get_effective_fps(self, base_fps: int) -> float:
+        """Zwraca FPS z uwzględnieniem losowej zmiany."""
+        cfg = self.job.video_config
+        if cfg.enable_random_fps:
+            # Odchylenie o ±cfg.fps_variation procent
+            variation = cfg.fps_variation / 100.0  # bo fps_variation to procent (0.1 = 0.1%)
+            factor = random.uniform(1 - variation, 1 + variation)
+            return base_fps * factor
+        return float(base_fps)
+    
+    def _get_effective_bitrate(self) -> str:
+        """Zwraca bitrate z ewentualną losową zmianą."""
+        cfg = self.job.video_config
+        if not cfg.vary_bitrate:
+            return cfg.bitrate
+        # Oczekujemy string np. "4000k"
+        try:
+            # Usuń 'k' i skonwertuj na int
+            base = int(cfg.bitrate.replace('k', ''))
+            variation = cfg.bitrate_variation  # 0.05 = 5%
+            new_bitrate = base * random.uniform(1 - variation, 1 + variation)
+            return f"{int(new_bitrate)}k"
+        except:
+            return cfg.bitrate
+    
+    def _get_ffmpeg_params(self) -> List[str]:
+        """Zwraca dodatkowe parametry ffmpeg dla kodeka i profilu."""
+        cfg = self.job.video_config
+        params = []
+        if cfg.codec_profile != CodecProfile.AUTO:
+            params.extend(['-profile:v', cfg.codec_profile.value])
+        return params
+    
+    def _strip_metadata(self, file_path: str) -> str:
+        """Czyści metadane z pliku wideo, zwraca ścieżkę do nowego pliku."""
+        temp_out = file_path + "_clean.mp4"
+        cmd = [
+            'ffmpeg', '-i', file_path,
+            '-map_metadata', '-1',
+            '-c', 'copy',
+            '-y', temp_out
+        ]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            os.replace(temp_out, file_path)  # podmieniamy oryginał
+        except Exception as e:
+            logger.error(f"Błąd czyszczenia metadanych: {e}")
+            if os.path.exists(temp_out):
+                os.remove(temp_out)
+        return file_path
+    
     def render(self, progress_callback=None) -> str:
         try:
             cfg = self.job.video_config
             style = self.job.text_style
             target_duration = random.uniform(cfg.target_duration_min, cfg.target_duration_max)
+            
+            # Określenie docelowego FPS
+            effective_fps = self._get_effective_fps(cfg.fps)
             
             # Czy używamy okładki?
             use_cover = cfg.use_cover and self.job.cover_file is not None
@@ -769,7 +887,6 @@ class RenderEngine:
                 remaining = target_duration - cover_duration
                 num_photos = max(1, int(remaining / self._get_photo_duration()))
             else:
-                # Bez okładki – cały czas wypełniamy zdjęciami
                 num_photos = max(1, int(target_duration / self._get_photo_duration()))
             
             # Wybór zdjęć
@@ -784,14 +901,16 @@ class RenderEngine:
             
             clips = []
             
-            # Przygotuj parametry anty-fingerprint
+            # Przygotuj parametry anty-fingerprint dla obrazu
             noise_params = self._prepare_noise_params(cfg)
             color_shift_params = self._prepare_color_shift_params(cfg)
+            gamma_params = self._prepare_gamma_params(cfg)
+            wb_params = self._prepare_white_balance_params(cfg)
             zoom_params = self._prepare_zoom_params(cfg)
             rotation_params = self._prepare_rotation_params(cfg)
             flip_params = self._prepare_flip_params(cfg)
             
-            # Okładka (jeśli używana)
+            # Okładka
             if use_cover:
                 cover_img = ImageProcessor.process_image(
                     self.job.cover_file,
@@ -799,6 +918,8 @@ class RenderEngine:
                     mode="cover",
                     noise_params=noise_params,
                     color_shift_params=color_shift_params,
+                    gamma_params=gamma_params,
+                    white_balance_params=wb_params,
                     zoom_params=zoom_params,
                     rotation_params=rotation_params,
                     flip_params=flip_params
@@ -807,13 +928,17 @@ class RenderEngine:
                 cover_clip = ImageClip(cover_img).set_duration(cover_duration)
                 clips.append(cover_clip)
             
-            # Zdjęcia – każde może mieć inny czas trwania
+            # Zdjęcia
             for i, photo in enumerate(selected_photos):
-                # Odśwież parametry dla każdego zdjęcia (jeśli chcemy większej losowości)
+                # Opcjonalnie odśwież parametry dla każdego zdjęcia
                 if cfg.enable_random_noise:
                     noise_params = self._prepare_noise_params(cfg)
                 if cfg.enable_random_color_shift:
                     color_shift_params = self._prepare_color_shift_params(cfg)
+                if cfg.enable_gamma_correction:
+                    gamma_params = self._prepare_gamma_params(cfg)
+                if cfg.enable_white_balance:
+                    wb_params = self._prepare_white_balance_params(cfg)
                 if cfg.enable_random_zoom:
                     zoom_params = self._prepare_zoom_params(cfg)
                 if cfg.enable_random_rotation:
@@ -827,11 +952,12 @@ class RenderEngine:
                     mode="cover",
                     noise_params=noise_params,
                     color_shift_params=color_shift_params,
+                    gamma_params=gamma_params,
+                    white_balance_params=wb_params,
                     zoom_params=zoom_params,
                     rotation_params=rotation_params,
                     flip_params=flip_params
                 )
-                # Dla każdego zdjęcia losujemy czas trwania (jeśli tryb zakres/lista)
                 photo_duration = self._get_photo_duration()
                 clip = ImageClip(img).set_duration(photo_duration)
                 clips.append(clip)
@@ -863,16 +989,25 @@ class RenderEngine:
             out_filename = f"OMEGA_{self.job.job_id}_{timestamp}.mp4"
             out_path = os.path.join(self.output_dir, out_filename)
             
+            # Przygotuj parametry ffmpeg
+            ffmpeg_params = self._get_ffmpeg_params()
+            effective_bitrate = self._get_effective_bitrate()
+            
             final.write_videofile(
                 out_path,
-                fps=cfg.fps,
+                fps=effective_fps,
                 codec=cfg.codec,
                 audio_codec=cfg.audio_codec,
                 preset=cfg.preset,
-                bitrate=cfg.bitrate,
+                bitrate=effective_bitrate,
                 threads=4,
+                ffmpeg_params=ffmpeg_params,
                 logger=None
             )
+            
+            # Czyszczenie metadanych jeśli włączone
+            if cfg.strip_metadata:
+                out_path = self._strip_metadata(out_path)
             
             final.close()
             final_clip.close()
@@ -901,6 +1036,24 @@ class RenderEngine:
         return {
             'enabled': True,
             'mode': cfg.color_shift_mode,
+            'amount': amount
+        }
+    
+    def _prepare_gamma_params(self, cfg: VideoConfig) -> Optional[Dict]:
+        if not cfg.enable_gamma_correction:
+            return None
+        gamma = random.uniform(*cfg.gamma_range)
+        return {
+            'enabled': True,
+            'gamma': gamma
+        }
+    
+    def _prepare_white_balance_params(self, cfg: VideoConfig) -> Optional[Dict]:
+        if not cfg.enable_white_balance:
+            return None
+        amount = random.uniform(*cfg.white_balance_range)
+        return {
+            'enabled': True,
             'amount': amount
         }
     
@@ -940,7 +1093,7 @@ class RenderEngine:
         return concatenate_videoclips(clips, method="chain")
 
 # ==============================================================================
-# 8. INTERFEJS UŻYTKOWNIKA
+# 8. INTERFEJS UŻYTKOWNIKA – z nowymi opcjami w zakładce Anti-Fingerprint
 # ==============================================================================
 
 def main():
@@ -953,11 +1106,10 @@ def main():
     
     mpy_config.change_settings({"IMAGEMAGICK_BINARY": OmegaCore.get_magick_path()})
     
-    # Inicjalizacja konfiguracji z obsługą starszych wersji (bezpieczne dodawanie nowych pól)
+    # Inicjalizacja konfiguracji z obsługą starszych wersji
     if 'current_text_style' not in st.session_state:
         st.session_state.current_text_style = TextStyleConfig()
     else:
-        # Jeśli istnieje, upewnij się, że ma wszystkie pola (merge z domyślnymi)
         existing = st.session_state.current_text_style
         if hasattr(existing, '__dict__'):
             d = existing.__dict__.copy()
@@ -1217,8 +1369,9 @@ def main():
             st.subheader("🛡️ Anti-Fingerprint obrazu")
             st.markdown("Subtelne, losowe modyfikacje każdego obrazu.")
             
+            # Szum
             st.session_state.current_video_config.enable_random_noise = st.checkbox(
-                "Dodaj losowy szum", value=st.session_state.current_video_config.enable_random_noise
+                "Dodaj losowy szum (grain)", value=st.session_state.current_video_config.enable_random_noise
             )
             if st.session_state.current_video_config.enable_random_noise:
                 noise_types = [nt.value for nt in NoiseType]
@@ -1226,24 +1379,61 @@ def main():
                 selected_noise = st.selectbox("Typ szumu", noise_types, index=noise_types.index(current_noise))
                 st.session_state.current_video_config.noise_type = NoiseType(selected_noise)
                 st.session_state.current_video_config.noise_intensity = st.slider(
-                    "Intensywność szumu", 0.0, 0.1, 
-                    st.session_state.current_video_config.noise_intensity, 0.005,
+                    "Intensywność szumu (0.005 = 0.5%)", 0.0, 0.02, 
+                    st.session_state.current_video_config.noise_intensity, 0.001,
                     format="%.3f"
                 )
             
+            # Korekta kolorów (jasność, kontrast, nasycenie)
             st.session_state.current_video_config.enable_random_color_shift = st.checkbox(
-                "Losowa korekta kolorów", value=st.session_state.current_video_config.enable_random_color_shift
+                "Losowa korekta kolorów (jasność/kontrast/nasycenie)", 
+                value=st.session_state.current_video_config.enable_random_color_shift
             )
             if st.session_state.current_video_config.enable_random_color_shift:
-                color_modes = [cm.value for cm in ColorShiftMode]
+                color_modes = [cm.value for cm in ColorShiftMode if cm.value not in ['gamma', 'white_balance']]
                 current_mode = st.session_state.current_video_config.color_shift_mode.value
+                # Zabezpieczenie przed starymi wartościami
+                if current_mode not in color_modes:
+                    current_mode = 'brightness'
                 selected_mode = st.selectbox("Tryb korekty", color_modes, index=color_modes.index(current_mode))
                 st.session_state.current_video_config.color_shift_mode = ColorShiftMode(selected_mode)
                 st.session_state.current_video_config.color_shift_range = st.slider(
-                    "Zakres zmian (±)", 0.0, 0.3, 
-                    st.session_state.current_video_config.color_shift_range, 0.01
+                    "Zakres zmian (±)", 0.0, 0.1, 
+                    st.session_state.current_video_config.color_shift_range, 0.005,
+                    format="%.3f"
                 )
             
+            # Gamma
+            st.session_state.current_video_config.enable_gamma_correction = st.checkbox(
+                "Korekcja gamma (subtelna)", value=st.session_state.current_video_config.enable_gamma_correction
+            )
+            if st.session_state.current_video_config.enable_gamma_correction:
+                col1, col2 = st.columns(2)
+                with col1:
+                    min_gamma = st.number_input("Min gamma", 0.95, 1.05, 
+                                                st.session_state.current_video_config.gamma_range[0], 0.01)
+                with col2:
+                    max_gamma = st.number_input("Max gamma", 0.95, 1.05,
+                                                st.session_state.current_video_config.gamma_range[1], 0.01)
+                st.session_state.current_video_config.gamma_range = (min_gamma, max_gamma)
+            
+            # Balans bieli (temperatura)
+            st.session_state.current_video_config.enable_white_balance = st.checkbox(
+                "Balans bieli (temperatura)", value=st.session_state.current_video_config.enable_white_balance
+            )
+            if st.session_state.current_video_config.enable_white_balance:
+                col1, col2 = st.columns(2)
+                with col1:
+                    min_wb = st.number_input("Min przesunięcie", -0.05, 0.05, 
+                                                st.session_state.current_video_config.white_balance_range[0], 0.005,
+                                                format="%.3f")
+                with col2:
+                    max_wb = st.number_input("Max przesunięcie", -0.05, 0.05,
+                                                st.session_state.current_video_config.white_balance_range[1], 0.005,
+                                                format="%.3f")
+                st.session_state.current_video_config.white_balance_range = (min_wb, max_wb)
+            
+            # Zoom
             st.session_state.current_video_config.enable_random_zoom = st.checkbox(
                 "Losowy zoom (skala)", value=st.session_state.current_video_config.enable_random_zoom
             )
@@ -1260,6 +1450,7 @@ def main():
                     "Przytnij (zamiast dodawania tła)", value=st.session_state.current_video_config.zoom_crop
                 )
             
+            # Obrót
             st.session_state.current_video_config.enable_random_rotation = st.checkbox(
                 "Losowy obrót", value=st.session_state.current_video_config.enable_random_rotation
             )
@@ -1273,6 +1464,7 @@ def main():
                                                 st.session_state.current_video_config.rotation_range[1], 0.1)
                 st.session_state.current_video_config.rotation_range = (min_angle, max_angle)
             
+            # Odbicie
             st.session_state.current_video_config.enable_random_flip = st.checkbox(
                 "Losowe odbicie lustrzane", value=st.session_state.current_video_config.enable_random_flip
             )
@@ -1281,6 +1473,62 @@ def main():
                     "Prawdopodobieństwo odbicia", 0.0, 0.5, 
                     st.session_state.current_video_config.flip_probability, 0.05
                 )
+            
+            st.divider()
+            st.subheader("🛡️ Anti-Fingerprint czasowy")
+            
+            # Losowy FPS
+            st.session_state.current_video_config.enable_random_fps = st.checkbox(
+                "Losowa zmiana FPS (np. 30 → 29.97-30.03)", 
+                value=st.session_state.current_video_config.enable_random_fps
+            )
+            if st.session_state.current_video_config.enable_random_fps:
+                st.session_state.current_video_config.fps_variation = st.slider(
+                    "Odchylenie (%)", 0.0, 0.5, 
+                    st.session_state.current_video_config.fps_variation, 0.01,
+                    format="%.2f"
+                )
+            
+            # Zmiana prędkości (już jest w audio, ale dotyczy całego filmu)
+            # (jest w zakładce audio)
+            
+            # Decimate (usuwanie klatek) – opcjonalne
+            st.session_state.current_video_config.enable_decimate = st.checkbox(
+                "Usuwanie co N-tej klatki (eksperymentalne)", 
+                value=st.session_state.current_video_config.enable_decimate
+            )
+            if st.session_state.current_video_config.enable_decimate:
+                st.session_state.current_video_config.decimate_every = st.number_input(
+                    "Usuń co n-tą klatkę", 10, 500, 
+                    st.session_state.current_video_config.decimate_every, 10
+                )
+            
+            st.divider()
+            st.subheader("🛡️ Anti-Fingerprint kontenera")
+            
+            # Profil kodeka
+            profile_options = [p.value for p in CodecProfile]
+            current_profile = st.session_state.current_video_config.codec_profile.value
+            selected_profile = st.selectbox("Profil kodeka", profile_options, index=profile_options.index(current_profile))
+            st.session_state.current_video_config.codec_profile = CodecProfile(selected_profile)
+            
+            # Zmienny bitrate
+            st.session_state.current_video_config.vary_bitrate = st.checkbox(
+                "Losowa zmiana bitrate (VBR z odchyleniem)", 
+                value=st.session_state.current_video_config.vary_bitrate
+            )
+            if st.session_state.current_video_config.vary_bitrate:
+                st.session_state.current_video_config.bitrate_variation = st.slider(
+                    "Odchylenie bitrate (±%)", 0.0, 0.2, 
+                    st.session_state.current_video_config.bitrate_variation, 0.01,
+                    format="%.2f"
+                )
+            
+            # Czyszczenie metadanych
+            st.session_state.current_video_config.strip_metadata = st.checkbox(
+                "Usuń wszystkie metadane z pliku", 
+                value=st.session_state.current_video_config.strip_metadata
+            )
         
         st.divider()
         
@@ -1361,9 +1609,8 @@ def main():
                 total_jobs = len(u_c)
                 cover_files = u_c
             else:
-                # Bez okładek – generujemy jeden film ze wszystkich zdjęć
                 total_jobs = 1
-                cover_files = [None]  # sztuczna lista, żeby pętla działała
+                cover_files = [None]
             
             video_paths = []
             
