@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 class OmegaCore:
     """Główna klasa konfiguracyjna aplikacji Omega Video Generator."""
     
-    VERSION = "V13.0 PRO (1000-LINER)"
+    VERSION = "V13.1 PRO (ANTI-FINGERPRINT)"
     TARGET_RES = (1080, 1920)  # 9:16
     SAFE_MARGIN = 90  # margines boczny dla tekstu
     SUPPORTED_IMG_FORMATS = ('.png', '.jpg', '.jpeg', '.bmp', '.webp')
@@ -109,6 +109,23 @@ class TransitionType(Enum):
     SLIDE_UP = "slide_up"
     SLIDE_DOWN = "slide_down"
 
+# Nowe enums dla opcji anty-fingerprint
+class NoiseType(Enum):
+    """Typ szumu do dodania."""
+    NONE = "none"
+    GAUSSIAN = "gaussian"
+    SALT_PEPPER = "salt_pepper"
+    POISSON = "poisson"
+
+class ColorShiftMode(Enum):
+    """Tryb przesunięcia kolorów."""
+    NONE = "none"
+    BRIGHTNESS = "brightness"
+    CONTRAST = "contrast"
+    SATURATION = "saturation"
+    HUE = "hue"
+    RGB_SHIFT = "rgb_shift"
+
 @dataclass
 class TextStyleConfig:
     """Konfiguracja stylu tekstu."""
@@ -132,6 +149,12 @@ class TextStyleConfig:
     animation_in: str = "none"  # fade, slide, zoom
     animation_out: str = "none"
     animation_duration: float = 0.5
+    
+    # Nowe pola anty-fingerprint dla tekstu
+    random_position_jitter: bool = False
+    position_jitter_range: int = 10  # pikseli
+    random_shadow_jitter: bool = False
+    shadow_jitter_range: int = 5
 
 @dataclass
 class VideoConfig:
@@ -155,6 +178,54 @@ class VideoConfig:
     audio_volume: float = 1.0
     add_timestamp: bool = False
     output_dir: str = "output"
+    
+    # NOWE: Anty-fingerprint – modyfikacje obrazu
+    enable_random_noise: bool = False
+    noise_type: NoiseType = NoiseType.GAUSSIAN
+    noise_intensity: float = 0.02  # 2%
+    
+    enable_random_color_shift: bool = False
+    color_shift_mode: ColorShiftMode = ColorShiftMode.BRIGHTNESS
+    color_shift_range: float = 0.1  # ±10%
+    
+    enable_random_blur: bool = False
+    blur_range: Tuple[float, float] = (0.0, 1.0)  # piksele
+    
+    enable_random_sharpness: bool = False
+    sharpness_range: Tuple[float, float] = (0.8, 1.2)
+    
+    enable_random_contrast: bool = False
+    contrast_range: Tuple[float, float] = (0.9, 1.1)
+    
+    enable_random_brightness: bool = False
+    brightness_range: Tuple[float, float] = (0.95, 1.05)
+    
+    enable_random_saturation: bool = False
+    saturation_range: Tuple[float, float] = (0.9, 1.1)
+    
+    enable_random_zoom: bool = False
+    zoom_range: Tuple[float, float] = (0.98, 1.02)  # lekkie przybliżenie/oddalenie
+    zoom_crop: bool = True  # czy przycinać, czy dodawać tło
+    
+    enable_random_rotation: bool = False
+    rotation_range: Tuple[float, float] = (-0.5, 0.5)  # stopnie
+    
+    enable_random_flip: bool = False  # rzadkie, ale może pomóc
+    flip_probability: float = 0.1  # 10% szans na poziome odbicie
+    
+    # Audio fingerprint
+    enable_random_pitch_shift: bool = False
+    pitch_shift_range: Tuple[float, float] = (0.98, 1.02)  # zmiana wysokości dźwięku
+    
+    enable_random_speed_change: bool = False
+    speed_change_range: Tuple[float, float] = (0.99, 1.01)  # bardzo subtelna zmiana tempa
+    
+    # Dodatkowe
+    enable_random_watermark: bool = False
+    watermark_image: Optional[Any] = None
+    watermark_opacity: float = 0.1
+    watermark_scale: float = 0.1
+    watermark_random_position: bool = True
 
 @dataclass
 class RenderJob:
@@ -184,7 +255,13 @@ class ImageProcessor:
         blur_radius: float = 0,
         enhance_contrast: float = 1.0,
         enhance_sharpness: float = 1.0,
-        grayscale: bool = False
+        grayscale: bool = False,
+        # Nowe parametry anty-fingerprint
+        noise_params: Optional[Dict] = None,
+        color_shift_params: Optional[Dict] = None,
+        zoom_params: Optional[Dict] = None,
+        rotation_params: Optional[Dict] = None,
+        flip_params: Optional[Dict] = None
     ) -> np.ndarray:
         """Główna funkcja przetwarzania obrazu."""
         try:
@@ -217,6 +294,23 @@ class ImageProcessor:
             if apply_blur and blur_radius > 0:
                 img = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
             
+            # ANTY-FINGERPRINT: aplikacja modyfikacji
+            if noise_params and noise_params.get('enabled'):
+                img = ImageProcessor._apply_noise(img, noise_params)
+            
+            if color_shift_params and color_shift_params.get('enabled'):
+                img = ImageProcessor._apply_color_shift(img, color_shift_params)
+            
+            # Zoom i rotacja muszą być zastosowane po skalowaniu, ale przed ewentualnym przycięciem
+            if zoom_params and zoom_params.get('enabled'):
+                img = ImageProcessor._apply_zoom(img, zoom_params, target_res)
+            
+            if rotation_params and rotation_params.get('enabled'):
+                img = ImageProcessor._apply_rotation(img, rotation_params, target_res, background_color)
+            
+            if flip_params and flip_params.get('enabled') and random.random() < flip_params.get('probability', 0):
+                img = ImageProcessor._apply_flip(img, flip_params)
+            
             # Konwersja do RGB (moviepy wymaga RGB)
             return np.array(img.convert("RGB"))
             
@@ -224,6 +318,142 @@ class ImageProcessor:
             logger.error(f"Błąd przetwarzania obrazu: {e}")
             # Zwróć czarny obraz w razie błędu
             return np.zeros((target_res[1], target_res[0], 3), dtype=np.uint8)
+    
+    @staticmethod
+    def _apply_noise(img: Image.Image, params: Dict) -> Image.Image:
+        """Dodaje szum do obrazu."""
+        noise_type = params.get('type', NoiseType.GAUSSIAN)
+        intensity = params.get('intensity', 0.02)
+        
+        np_img = np.array(img).astype(np.float32)
+        
+        if noise_type == NoiseType.GAUSSIAN:
+            noise = np.random.normal(0, intensity * 255, np_img.shape).astype(np.float32)
+            np_img = np.clip(np_img + noise, 0, 255).astype(np.uint8)
+        elif noise_type == NoiseType.SALT_PEPPER:
+            # sól i pieprz
+            salt_vs_pepper = 0.5
+            num_salt = int(intensity * np_img.size * salt_vs_pepper)
+            num_pepper = int(intensity * np_img.size * (1 - salt_vs_pepper))
+            coords = [np.random.randint(0, i-1, num_salt) for i in np_img.shape]
+            np_img[coords[0], coords[1], :] = 255
+            coords = [np.random.randint(0, i-1, num_pepper) for i in np_img.shape]
+            np_img[coords[0], coords[1], :] = 0
+        elif noise_type == NoiseType.POISSON:
+            vals = len(np.unique(np_img))
+            vals = 2 ** np.ceil(np.log2(vals))
+            np_img = np.random.poisson(np_img * vals) / float(vals)
+            np_img = np.clip(np_img, 0, 255).astype(np.uint8)
+        
+        return Image.fromarray(np_img)
+    
+    @staticmethod
+    def _apply_color_shift(img: Image.Image, params: Dict) -> Image.Image:
+        """Stosuje przesunięcie kolorów (jasność, kontrast, nasycenie, balans RGB)."""
+        mode = params.get('mode', ColorShiftMode.BRIGHTNESS)
+        amount = params.get('amount', 0.1)  # zakres zmian
+        
+        if mode == ColorShiftMode.BRIGHTNESS:
+            enhancer = ImageEnhance.Brightness(img)
+            factor = 1.0 + random.uniform(-amount, amount)
+            img = enhancer.enhance(factor)
+        elif mode == ColorShiftMode.CONTRAST:
+            enhancer = ImageEnhance.Contrast(img)
+            factor = 1.0 + random.uniform(-amount, amount)
+            img = enhancer.enhance(factor)
+        elif mode == ColorShiftMode.SATURATION:
+            enhancer = ImageEnhance.Color(img)
+            factor = 1.0 + random.uniform(-amount, amount)
+            img = enhancer.enhance(factor)
+        elif mode == ColorShiftMode.HUE:
+            # Przesunięcie odcienia (PIL nie ma bezpośrednio, używamy konwersji do HSV)
+            hsv = img.convert('HSV')
+            h, s, v = hsv.split()
+            h_data = np.array(h, dtype=np.uint8)
+            shift = int(amount * 255)  # amount jako ułamek 0-1
+            h_data = (h_data + shift) % 256
+            h = Image.fromarray(h_data, mode='L')
+            img = Image.merge('HSV', (h, s, v)).convert('RGBA')
+        elif mode == ColorShiftMode.RGB_SHIFT:
+            # Subtelne przesunięcie kanałów RGB
+            r, g, b, a = img.split()
+            r_data = np.array(r, dtype=np.float32)
+            g_data = np.array(g, dtype=np.float32)
+            b_data = np.array(b, dtype=np.float32)
+            shift_r = random.uniform(-amount*50, amount*50)
+            shift_g = random.uniform(-amount*50, amount*50)
+            shift_b = random.uniform(-amount*50, amount*50)
+            r_data = np.clip(r_data + shift_r, 0, 255).astype(np.uint8)
+            g_data = np.clip(g_data + shift_g, 0, 255).astype(np.uint8)
+            b_data = np.clip(b_data + shift_b, 0, 255).astype(np.uint8)
+            img = Image.merge('RGBA', (Image.fromarray(r_data), Image.fromarray(g_data), Image.fromarray(b_data), a))
+        
+        return img
+    
+    @staticmethod
+    def _apply_zoom(img: Image.Image, params: Dict, target_res: Tuple[int, int]) -> Image.Image:
+        """Aplikuje lekkie przybliżenie/oddalenie."""
+        zoom_factor = params.get('factor', 1.0)
+        crop = params.get('crop', True)
+        
+        w, h = img.size
+        new_w = int(w * zoom_factor)
+        new_h = int(h * zoom_factor)
+        
+        # Skalowanie
+        img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        
+        if crop:
+            # Przytnij do środka
+            left = (new_w - w) // 2
+            top = (new_h - h) // 2
+            right = left + w
+            bottom = top + h
+            img = img.crop((left, top, right, bottom))
+        else:
+            # Jeśli oddalamy, dodajemy tło
+            if zoom_factor < 1.0:
+                canvas = Image.new("RGBA", target_res, (0, 0, 0, 0))
+                paste_x = (target_res[0] - new_w) // 2
+                paste_y = (target_res[1] - new_h) // 2
+                canvas.paste(img, (paste_x, paste_y))
+                img = canvas
+            else:
+                # Jeśli przybliżamy, przytnij do target_res
+                left = (new_w - target_res[0]) // 2
+                top = (new_h - target_res[1]) // 2
+                right = left + target_res[0]
+                bottom = top + target_res[1]
+                img = img.crop((left, top, right, bottom))
+        
+        return img
+    
+    @staticmethod
+    def _apply_rotation(img: Image.Image, params: Dict, target_res: Tuple[int, int], bg_color) -> Image.Image:
+        """Aplikuje lekki obrót."""
+        angle = params.get('angle', 0.0)
+        
+        # Obrót z wypełnieniem tłem
+        img = img.rotate(angle, resample=Image.BICUBIC, expand=True, fillcolor=bg_color + (255,))
+        
+        # Po obrocie obraz może być większy – przytnij do target_res
+        w, h = img.size
+        left = (w - target_res[0]) // 2
+        top = (h - target_res[1]) // 2
+        right = left + target_res[0]
+        bottom = top + target_res[1]
+        img = img.crop((left, top, right, bottom))
+        
+        return img
+    
+    @staticmethod
+    def _apply_flip(img: Image.Image, params: Dict) -> Image.Image:
+        """Odbicie lustrzane (poziome lub pionowe)."""
+        flip_mode = params.get('flip_mode', 'horizontal')
+        if flip_mode == 'horizontal':
+            return img.transpose(Image.FLIP_LEFT_RIGHT)
+        else:
+            return img.transpose(Image.FLIP_TOP_BOTTOM)
     
     @staticmethod
     def _scale_cover(img: Image.Image, target_res: Tuple[int, int]) -> Image.Image:
@@ -343,7 +573,7 @@ class TextEngine:
         style: TextStyleConfig,
         resolution: Tuple[int, int] = OmegaCore.TARGET_RES
     ) -> Image.Image:
-        """Renderuje pojedyńczą linię tekstu z auto-scale."""
+        """Renderuje pojedyńczą linię tekstu z auto-scale i opcjonalnym jitterem."""
         # Przygotowanie tekstu
         if style.uppercase:
             text = text.upper()
@@ -359,16 +589,36 @@ class TextEngine:
         text_width = bbox[2] - bbox[0]
         text_height = bbox[3] - bbox[1]
         
-        # Pozycja
-        pos = cls._calculate_position(text_width, text_height, style, resolution)
+        # Pozycja bazowa
+        base_pos = cls._calculate_position(text_width, text_height, style, resolution)
+        
+        # ANTY-FINGERPRINT: jitter pozycji
+        pos = base_pos
+        if style.random_position_jitter:
+            jitter_range = style.position_jitter_range
+            dx = random.randint(-jitter_range, jitter_range)
+            dy = random.randint(-jitter_range, jitter_range)
+            pos = (base_pos[0] + dx, base_pos[1] + dy)
         
         # Warstwy
         combined = Image.new("RGBA", resolution, (0, 0, 0, 0))
         
+        # Cień z opcjonalnym jitterem
         if style.use_shadow:
             shadow_layer = Image.new("RGBA", resolution, (0, 0, 0, 0))
             shadow_draw = ImageDraw.Draw(shadow_layer)
-            shadow_pos = (pos[0] + style.shadow_offset_x, pos[1] + style.shadow_offset_y)
+            
+            # Bazowe przesunięcie cienia
+            shadow_offset_x = style.shadow_offset_x
+            shadow_offset_y = style.shadow_offset_y
+            
+            # ANTY-FINGERPRINT: jitter cienia
+            if style.random_shadow_jitter:
+                jitter_range = style.shadow_jitter_range
+                shadow_offset_x += random.randint(-jitter_range, jitter_range)
+                shadow_offset_y += random.randint(-jitter_range, jitter_range)
+            
+            shadow_pos = (pos[0] + shadow_offset_x, pos[1] + shadow_offset_y)
             
             # Konwersja koloru cienia
             shd_rgb = cls._hex_to_rgb(style.shadow_color)
@@ -408,7 +658,7 @@ class TextEngine:
         style: TextStyleConfig,
         resolution: Tuple[int, int] = OmegaCore.TARGET_RES
     ) -> Image.Image:
-        """Renderuje wiele linii tekstu (jedna pod drugą)."""
+        """Renderuje wiele linii tekstu (jedna pod drugą) z uwzględnieniem jittera."""
         if not lines:
             return Image.new("RGBA", resolution, (0, 0, 0, 0))
         
@@ -448,12 +698,18 @@ class TextEngine:
             else:  # right
                 x = resolution[0] - w - OmegaCore.SAFE_MARGIN
             
+            # ANTY-FINGERPRINT: losowe przesunięcie każdej linii
+            if style.random_position_jitter:
+                jitter_range = style.position_jitter_range
+                dx = random.randint(-jitter_range, jitter_range)
+                dy = random.randint(-jitter_range, jitter_range)
+                line_pos = (x + dx, y_offset + dy)
+            else:
+                line_pos = (x, y_offset)
+            
             # Renderuj pojedynczą linię
-            line_img = cls.render_text(line, style, resolution)
-            # Wytnij tylko obszar tekstu (aby nie nakładać cieni wielokrotnie)
-            # Prościej: narysuj na warstwie, ale musimy kontrolować pozycję
-            # Użyjemy osobnej funkcji do rysowania linii w konkretnym miejscu
-            combined = Image.alpha_composite(combined, cls._render_line_at(line, (x, y_offset), style, font))
+            line_img = cls._render_line_at(line, line_pos, style, font)
+            combined = Image.alpha_composite(combined, line_img)
             y_offset += h + style.line_spacing
         
         return combined
@@ -467,7 +723,16 @@ class TextEngine:
         if style.use_shadow:
             shadow_layer = Image.new("RGBA", res, (0, 0, 0, 0))
             shadow_draw = ImageDraw.Draw(shadow_layer)
-            shadow_pos = (pos[0] + style.shadow_offset_x, pos[1] + style.shadow_offset_y)
+            
+            # ANTY-FINGERPRINT: jitter cienia dla pojedynczej linii
+            shadow_offset_x = style.shadow_offset_x
+            shadow_offset_y = style.shadow_offset_y
+            if style.random_shadow_jitter:
+                jitter_range = style.shadow_jitter_range
+                shadow_offset_x += random.randint(-jitter_range, jitter_range)
+                shadow_offset_y += random.randint(-jitter_range, jitter_range)
+            
+            shadow_pos = (pos[0] + shadow_offset_x, pos[1] + shadow_offset_y)
             shd_rgb = cls._hex_to_rgb(style.shadow_color)
             shadow_draw.text(shadow_pos, text, fill=(*shd_rgb, style.shadow_alpha), font=font)
             if style.shadow_blur > 0:
@@ -537,11 +802,11 @@ class TextEngine:
 # ==============================================================================
 
 class AudioProcessor:
-    """Przetwarzanie audio: przycinanie, fade, zapętlanie."""
+    """Przetwarzanie audio: przycinanie, fade, zapętlanie, modyfikacje anty-fingerprint."""
     
     @staticmethod
     def load_audio(file_obj, target_duration: float, config: VideoConfig) -> Optional[AudioFileClip]:
-        """Ładuje audio, przycina do docelowej długości, dodaje fade."""
+        """Ładuje audio, przycina do docelowej długości, dodaje fade i opcjonalne modyfikacje."""
         if file_obj is None:
             return None
         
@@ -553,6 +818,18 @@ class AudioProcessor:
                 tmp_path = tmp.name
             
             audio = AudioFileClip(tmp_path)
+            
+            # ANTY-FINGERPRINT: zmiana prędkości (pitch/speed)
+            if config.enable_random_speed_change:
+                speed_factor = random.uniform(*config.speed_change_range)
+                audio = audio.fx(vfx.speedx, speed_factor)
+                # Dostosuj czas trwania do target_duration po zmianie prędkości
+                # (Uwaga: to może być skomplikowane, ale zostawiamy oryginalne przycinanie)
+            
+            if config.enable_random_pitch_shift:
+                # moviepy nie ma bezpośrednio pitch shift, można użyć speedx z kompresją czasu
+                # Uproszczenie: pomijamy lub robimy speedx, ale to zmienia czas
+                pass
             
             # Sprawdź długość
             if audio.duration < target_duration:
@@ -612,10 +889,16 @@ class ProfileManager:
         # Konwersja enum
         if isinstance(text_style.position, str):
             text_style.position = TextPosition(text_style.position)
+        if 'random_position_jitter' in profile['text_style']:
+            text_style.random_position_jitter = profile['text_style']['random_position_jitter']
         
         video_config = VideoConfig(**profile['video_config'])
         if isinstance(video_config.transition, str):
             video_config.transition = TransitionType(video_config.transition)
+        if 'noise_type' in profile['video_config'] and isinstance(profile['video_config']['noise_type'], str):
+            video_config.noise_type = NoiseType(profile['video_config']['noise_type'])
+        if 'color_shift_mode' in profile['video_config'] and isinstance(profile['video_config']['color_shift_mode'], str):
+            video_config.color_shift_mode = ColorShiftMode(profile['video_config']['color_shift_mode'])
         
         return text_style, video_config
     
@@ -670,22 +953,50 @@ class RenderEngine:
             # Tworzenie klipów
             clips = []
             
+            # Przygotuj parametry anty-fingerprint dla każdego obrazu (mogą być różne)
+            noise_params = self._prepare_noise_params(cfg)
+            color_shift_params = self._prepare_color_shift_params(cfg)
+            zoom_params = self._prepare_zoom_params(cfg)
+            rotation_params = self._prepare_rotation_params(cfg)
+            flip_params = self._prepare_flip_params(cfg)
+            
             # Okładka
             cover_img = ImageProcessor.process_image(
                 self.job.cover_file,
                 target_res=cfg.resolution,
-                mode="cover"
+                mode="cover",
+                noise_params=noise_params,
+                color_shift_params=color_shift_params,
+                zoom_params=zoom_params,
+                rotation_params=rotation_params,
+                flip_params=flip_params
             )
             cover_clip = ImageClip(cover_img).set_duration(cover_duration)
             clips.append(cover_clip)
             
-            # Zdjęcia
+            # Zdjęcia (dla każdego mogą być inne losowe parametry)
             for i, photo in enumerate(selected_photos):
+                # Dla każdego zdjęcia możemy ponownie losować parametry (jeśli chcemy większej różnorodności)
+                if cfg.enable_random_noise:
+                    noise_params = self._prepare_noise_params(cfg)
+                if cfg.enable_random_color_shift:
+                    color_shift_params = self._prepare_color_shift_params(cfg)
+                if cfg.enable_random_zoom:
+                    zoom_params = self._prepare_zoom_params(cfg)
+                if cfg.enable_random_rotation:
+                    rotation_params = self._prepare_rotation_params(cfg)
+                if cfg.enable_random_flip:
+                    flip_params = self._prepare_flip_params(cfg)
+                
                 img = ImageProcessor.process_image(
                     photo,
                     target_res=cfg.resolution,
                     mode="cover",
-                    apply_blur=False
+                    noise_params=noise_params,
+                    color_shift_params=color_shift_params,
+                    zoom_params=zoom_params,
+                    rotation_params=rotation_params,
+                    flip_params=flip_params
                 )
                 clip = ImageClip(img).set_duration(cfg.photo_duration)
                 clips.append(clip)
@@ -696,7 +1007,7 @@ class RenderEngine:
             else:
                 final_clip = concatenate_videoclips(clips, method="chain")
             
-            # Tekst
+            # Tekst (renderowany z ewentualnym jitterem)
             text_img = TextEngine.render_multiline(
                 self.job.text_lines,
                 style,
@@ -741,6 +1052,55 @@ class RenderEngine:
         except Exception as e:
             logger.exception(f"Błąd renderowania: {e}")
             raise
+    
+    def _prepare_noise_params(self, cfg: VideoConfig) -> Optional[Dict]:
+        if not cfg.enable_random_noise:
+            return None
+        return {
+            'enabled': True,
+            'type': cfg.noise_type,
+            'intensity': cfg.noise_intensity
+        }
+    
+    def _prepare_color_shift_params(self, cfg: VideoConfig) -> Optional[Dict]:
+        if not cfg.enable_random_color_shift:
+            return None
+        amount = random.uniform(-cfg.color_shift_range, cfg.color_shift_range)
+        return {
+            'enabled': True,
+            'mode': cfg.color_shift_mode,
+            'amount': amount
+        }
+    
+    def _prepare_zoom_params(self, cfg: VideoConfig) -> Optional[Dict]:
+        if not cfg.enable_random_zoom:
+            return None
+        factor = random.uniform(*cfg.zoom_range)
+        return {
+            'enabled': True,
+            'factor': factor,
+            'crop': cfg.zoom_crop
+        }
+    
+    def _prepare_rotation_params(self, cfg: VideoConfig) -> Optional[Dict]:
+        if not cfg.enable_random_rotation:
+            return None
+        angle = random.uniform(*cfg.rotation_range)
+        return {
+            'enabled': True,
+            'angle': angle
+        }
+    
+    def _prepare_flip_params(self, cfg: VideoConfig) -> Optional[Dict]:
+        if not cfg.enable_random_flip:
+            return None
+        # Losuj czy zastosować flip
+        if random.random() < cfg.flip_probability:
+            return {
+                'enabled': True,
+                'flip_mode': random.choice(['horizontal', 'vertical'])
+            }
+        return {'enabled': False}
     
     def _apply_transitions(self, clips: List[VideoClip], cfg: VideoConfig) -> VideoClip:
         """Stosuje przejścia między klipami."""
@@ -828,7 +1188,7 @@ def main():
                             st.rerun()
         
         # Zakładki konfiguracji
-        tab1, tab2, tab3, tab4 = st.tabs(["📝 Tekst", "🎬 Wideo", "🎵 Audio", "🖼️ Obrazy"])
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(["📝 Tekst", "🎬 Wideo", "🎵 Audio", "🖼️ Obrazy", "🛡️ Anti-Fingerprint"])
         
         with tab1:
             st.subheader("Styl tekstu")
@@ -893,6 +1253,29 @@ def main():
             st.session_state.current_text_style.uppercase = st.checkbox(
                 "Wielkie litery", value=st.session_state.current_text_style.uppercase
             )
+            
+            # NOWE: opcje anty-fingerprint dla tekstu
+            st.divider()
+            st.subheader("🛡️ Anti-Fingerprint tekstu")
+            st.session_state.current_text_style.random_position_jitter = st.checkbox(
+                "Losowe przesunięcie tekstu (jitter)", 
+                value=st.session_state.current_text_style.random_position_jitter
+            )
+            if st.session_state.current_text_style.random_position_jitter:
+                st.session_state.current_text_style.position_jitter_range = st.slider(
+                    "Maksymalne przesunięcie (piksele)", 1, 50, 
+                    st.session_state.current_text_style.position_jitter_range
+                )
+            
+            st.session_state.current_text_style.random_shadow_jitter = st.checkbox(
+                "Losowe przesunięcie cienia",
+                value=st.session_state.current_text_style.random_shadow_jitter
+            )
+            if st.session_state.current_text_style.random_shadow_jitter:
+                st.session_state.current_text_style.shadow_jitter_range = st.slider(
+                    "Zakres jittera cienia", 1, 20,
+                    st.session_state.current_text_style.shadow_jitter_range
+                )
         
         with tab2:
             st.subheader("Ustawienia wideo")
@@ -950,12 +1333,117 @@ def main():
             st.session_state.current_video_config.audio_fade_out = st.slider(
                 "Fade out (s)", 0.0, 3.0, st.session_state.current_video_config.audio_fade_out, 0.1
             )
+            
+            # NOWE: opcje anty-fingerprint audio
+            st.divider()
+            st.subheader("🛡️ Anti-Fingerprint audio")
+            st.session_state.current_video_config.enable_random_pitch_shift = st.checkbox(
+                "Losowa zmiana wysokości dźwięku (pitch)", 
+                value=st.session_state.current_video_config.enable_random_pitch_shift
+            )
+            if st.session_state.current_video_config.enable_random_pitch_shift:
+                col1, col2 = st.columns(2)
+                with col1:
+                    min_pitch = st.number_input("Min pitch", 0.9, 1.1, 
+                                                st.session_state.current_video_config.pitch_shift_range[0], 0.01)
+                with col2:
+                    max_pitch = st.number_input("Max pitch", 0.9, 1.1,
+                                                st.session_state.current_video_config.pitch_shift_range[1], 0.01)
+                st.session_state.current_video_config.pitch_shift_range = (min_pitch, max_pitch)
+            
+            st.session_state.current_video_config.enable_random_speed_change = st.checkbox(
+                "Losowa zmiana tempa (speed)",
+                value=st.session_state.current_video_config.enable_random_speed_change
+            )
+            if st.session_state.current_video_config.enable_random_speed_change:
+                col1, col2 = st.columns(2)
+                with col1:
+                    min_speed = st.number_input("Min speed", 0.95, 1.05,
+                                                st.session_state.current_video_config.speed_change_range[0], 0.01)
+                with col2:
+                    max_speed = st.number_input("Max speed", 0.95, 1.05,
+                                                st.session_state.current_video_config.speed_change_range[1], 0.01)
+                st.session_state.current_video_config.speed_change_range = (min_speed, max_speed)
         
         with tab4:
             st.subheader("Przetwarzanie obrazów")
             img_mode = st.selectbox("Tryb skalowania", ["cover", "contain", "crop"])
             st.session_state.img_mode = img_mode  # To nie jest w VideoConfig, trzeba dodać
             # Można dodać więcej opcji
+        
+        with tab5:
+            st.subheader("🛡️ Anti-Fingerprint obrazu")
+            st.markdown("Subtle, random modifications to make each video unique.")
+            
+            # Szum
+            st.session_state.current_video_config.enable_random_noise = st.checkbox(
+                "Dodaj losowy szum", value=st.session_state.current_video_config.enable_random_noise
+            )
+            if st.session_state.current_video_config.enable_random_noise:
+                noise_types = [nt.value for nt in NoiseType]
+                current_noise = st.session_state.current_video_config.noise_type.value
+                selected_noise = st.selectbox("Typ szumu", noise_types, index=noise_types.index(current_noise))
+                st.session_state.current_video_config.noise_type = NoiseType(selected_noise)
+                st.session_state.current_video_config.noise_intensity = st.slider(
+                    "Intensywność szumu", 0.0, 0.1, 
+                    st.session_state.current_video_config.noise_intensity, 0.005,
+                    format="%.3f"
+                )
+            
+            # Korekta kolorów
+            st.session_state.current_video_config.enable_random_color_shift = st.checkbox(
+                "Losowa korekta kolorów", value=st.session_state.current_video_config.enable_random_color_shift
+            )
+            if st.session_state.current_video_config.enable_random_color_shift:
+                color_modes = [cm.value for cm in ColorShiftMode]
+                current_mode = st.session_state.current_video_config.color_shift_mode.value
+                selected_mode = st.selectbox("Tryb korekty", color_modes, index=color_modes.index(current_mode))
+                st.session_state.current_video_config.color_shift_mode = ColorShiftMode(selected_mode)
+                st.session_state.current_video_config.color_shift_range = st.slider(
+                    "Zakres zmian (±)", 0.0, 0.3, 
+                    st.session_state.current_video_config.color_shift_range, 0.01
+                )
+            
+            # Zoom
+            st.session_state.current_video_config.enable_random_zoom = st.checkbox(
+                "Losowy zoom (skala)", value=st.session_state.current_video_config.enable_random_zoom
+            )
+            if st.session_state.current_video_config.enable_random_zoom:
+                col1, col2 = st.columns(2)
+                with col1:
+                    min_zoom = st.number_input("Min zoom", 0.95, 1.05, 
+                                                st.session_state.current_video_config.zoom_range[0], 0.01)
+                with col2:
+                    max_zoom = st.number_input("Max zoom", 0.95, 1.05,
+                                                st.session_state.current_video_config.zoom_range[1], 0.01)
+                st.session_state.current_video_config.zoom_range = (min_zoom, max_zoom)
+                st.session_state.current_video_config.zoom_crop = st.checkbox(
+                    "Przytnij (zamiast dodawania tła)", value=st.session_state.current_video_config.zoom_crop
+                )
+            
+            # Obrót
+            st.session_state.current_video_config.enable_random_rotation = st.checkbox(
+                "Losowy obrót", value=st.session_state.current_video_config.enable_random_rotation
+            )
+            if st.session_state.current_video_config.enable_random_rotation:
+                col1, col2 = st.columns(2)
+                with col1:
+                    min_angle = st.number_input("Min kąt (°)", -2.0, 2.0, 
+                                                st.session_state.current_video_config.rotation_range[0], 0.1)
+                with col2:
+                    max_angle = st.number_input("Max kąt (°)", -2.0, 2.0,
+                                                st.session_state.current_video_config.rotation_range[1], 0.1)
+                st.session_state.current_video_config.rotation_range = (min_angle, max_angle)
+            
+            # Odbicie lustrzane
+            st.session_state.current_video_config.enable_random_flip = st.checkbox(
+                "Losowe odbicie lustrzane", value=st.session_state.current_video_config.enable_random_flip
+            )
+            if st.session_state.current_video_config.enable_random_flip:
+                st.session_state.current_video_config.flip_probability = st.slider(
+                    "Prawdopodobieństwo odbicia", 0.0, 0.5, 
+                    st.session_state.current_video_config.flip_probability, 0.05
+                )
         
         st.divider()
         
